@@ -1,179 +1,266 @@
-# Creates a GitHub release, builds the program for multiple targets, then
-# uploads the build assets to the GitHub release. Uses the body of the
-# annotated tag (git tag -a) to populate the body of the release.
+# Copyright 2022-2023, axodotdev
+# SPDX-License-Identifier: MIT or Apache-2.0
 #
-# Based on the following:
-# https://github.com/BurntSushi/ripgrep/blob/df83b8b44426b3f2179abe632eb183e8c8270524/.github/workflows/release.yml
-# https://eugene-babichenko.github.io/blog/2020/05/09/github-actions-cross-platform-auto-releases/
+# CI that:
+#
+# * checks for a Git Tag that looks like a release
+# * builds artifacts with cargo-dist (archives, installers, hashes)
+# * uploads those artifacts to temporary workflow zip
+# * on success, uploads the artifacts to a Github Release
+#
+# Note that the Github Release will be created with a generated
+# title/body based on your changelogs.
 
-name: release
+name: Release
+
+permissions:
+  contents: write
+
+# This task will run whenever you push a git tag that looks like a version
+# like "1.0.0", "v0.1.0-prerelease.1", "my-app/0.1.0", "releases/v1.0.0", etc.
+# Various formats will be parsed into a VERSION and an optional PACKAGE_NAME, where
+# PACKAGE_NAME must be the name of a Cargo package in your workspace, and VERSION
+# must be a Cargo-style SemVer Version (must have at least major.minor.patch).
+#
+# If PACKAGE_NAME is specified, then the announcement will be for that
+# package (erroring out if it doesn't have the given version or isn't cargo-dist-able).
+#
+# If PACKAGE_NAME isn't specified, then the announcement will be for all
+# (cargo-dist-able) packages in the workspace with that version (this mode is
+# intended for workspaces with only one dist-able package, or with all dist-able
+# packages versioned/released in lockstep).
+#
+# If you push multiple tags at once, separate instances of this workflow will
+# spin up, creating an independent announcement for each one. However Github
+# will hard limit this to 3 tags per commit, as it will assume more tags is a
+# mistake.
+#
+# If there's a prerelease-style suffix to the version, then the release(s)
+# will be marked as a prerelease.
 on:
   push:
-    # Enable when testing release infrastructure on a branch.
-    # branches:
-    # - ci_testing
     tags:
-      # Despite their appearance, these are NOT regular expressions =(
-      # https://docs.github.com/en/actions/using-workflows/workflow-syntax-for-github-actions#filter-pattern-cheat-sheet
-      - "[0-9]+.[0-9]+.[0-9]+"
-      - "[0-9]+.[0-9]+.[0-9]+-*" # prerelease
+      - '**[0-9]+.[0-9]+.[0-9]+*'
+  pull_request:
+
 jobs:
-  create-release:
-    runs-on: ubuntu-20.04
+  # Run 'cargo dist plan' (or host) to determine what tasks we need to do
+  plan:
+    runs-on: ubuntu-latest
     outputs:
-      id: ${{ steps.release.outputs.id }}
-      upload_url: ${{ steps.release.outputs.upload_url }}
+      val: ${{ steps.plan.outputs.manifest }}
+      tag: ${{ !github.event.pull_request && github.ref_name || '' }}
+      tag-flag: ${{ !github.event.pull_request && format('--tag={0}', github.ref_name) || '' }}
+      publishing: ${{ !github.event.pull_request }}
     env:
-      RELEASE_BODY_FILE_NAME: __release_body_file_dont_commit__.md
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-      - name: Create release body file
-        shell: bash
-        run: |
-          if [ "${{ github.ref_type }}" = "tag" ]; then
-            git tag -l ${{ github.ref }} --format='%(contents)' > $RELEASE_BODY_FILE_NAME
-          else
-            echo "test release, please ignore" > $RELEASE_BODY_FILE_NAME
-          fi
-      - name: Create GitHub release
-        id: release
-        uses: actions/create-release@v1.1.4
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/checkout@v4
         with:
-          tag_name: ${{ github.ref_name }}
-          release_name: ${{ github.ref_name }}
-          draft: true
-          body_path: ${{ env.RELEASE_BODY_FILE_NAME }}
-          prerelease: ${{ contains(github.ref_name, '-') }}
+          submodules: recursive
+      - name: Install cargo-dist
+        # we specify bash to get pipefail; it guards against the `curl` command
+        # failing. otherwise `sh` won't catch that `curl` returned non-0
+        shell: bash
+        run: "curl --proto '=https' --tlsv1.2 -LsSf https://github.com/axodotdev/cargo-dist/releases/download/v0.11.1/cargo-dist-installer.sh | sh"
+      # sure would be cool if github gave us proper conditionals...
+      # so here's a doubly-nested ternary-via-truthiness to try to provide the best possible
+      # functionality based on whether this is a pull_request, and whether it's from a fork.
+      # (PRs run on the *source* but secrets are usually on the *target* -- that's *good*
+      # but also really annoying to build CI around when it needs secrets to work right.)
+      - id: plan
+        run: |
+          cargo dist ${{ (!github.event.pull_request && format('host --steps=create --tag={0}', github.ref_name)) || 'plan' }} --output-format=json > plan-dist-manifest.json
+          echo "cargo dist ran successfully"
+          cat plan-dist-manifest.json
+          echo "manifest=$(jq -c "." plan-dist-manifest.json)" >> "$GITHUB_OUTPUT"
+      - name: "Upload dist-manifest.json"
+        uses: actions/upload-artifact@v4
+        with:
+          name: artifacts-plan-dist-manifest
+          path: plan-dist-manifest.json
 
-  build-release:
-    needs: ["create-release"]
-    runs-on: ${{ matrix.image }}
-    env:
-      # Emit backtraces on panics.
-      RUST_BACKTRACE: 1
-      # The name of the program executable.
-      PROGRAM_NAME: smeagol-wiki
+  # Build and packages all the platform-specific things
+  build-local-artifacts:
+    name: build-local-artifacts (${{ join(matrix.targets, ', ') }})
+    # Let the initial task tell us to not run (currently very blunt)
+    needs:
+      - plan
+    if: ${{ fromJson(needs.plan.outputs.val).ci.github.artifacts_matrix.include != null && (needs.plan.outputs.publishing == 'true' || fromJson(needs.plan.outputs.val).ci.github.pr_run_mode == 'upload') }}
     strategy:
-      matrix:
-        include:
-          - build: linux-x64
-            os: ubuntu
-            image: ubuntu-20.04
-            target: x86_64-unknown-linux-gnu
-            use-cross: false
-          - build: linux-arm32
-            os: ubuntu
-            image: ubuntu-20.04
-            target: arm-unknown-linux-gnueabihf
-            use-cross: true
-          - build: linux-arm64
-            os: ubuntu
-            image: ubuntu-20.04
-            target: aarch64-unknown-linux-gnu
-            use-cross: true
-          - build: macos-x64
-            os: macos
-            image: macos-12
-            target: x86_64-apple-darwin
-            use-cross: false
-          - build: macos-arm64
-            os: macos
-            image: macos-12
-            target: aarch64-apple-darwin
-            use-cross: false
-          - build: win-x64-msvc
-            os: windows
-            image: windows-2022
-            target: x86_64-pc-windows-msvc
-            use-cross: false
-          - build: win-x86-msvc
-            os: windows
-            image: windows-2022
-            target: i686-pc-windows-msvc
-            use-cross: false
-          - build: win-arm64-msvc
-            os: windows
-            image: windows-2022
-            target: aarch64-pc-windows-msvc
-            use-cross: false
-
+      fail-fast: false
+      # Target platforms/runners are computed by cargo-dist in create-release.
+      # Each member of the matrix has the following arguments:
+      #
+      # - runner: the github runner
+      # - dist-args: cli flags to pass to cargo dist
+      # - install-dist: expression to run to install cargo-dist on the runner
+      #
+      # Typically there will be:
+      # - 1 "global" task that builds universal installers
+      # - N "local" tasks that build each platform's binaries and platform-specific installers
+      matrix: ${{ fromJson(needs.plan.outputs.val).ci.github.artifacts_matrix }}
+    runs-on: ${{ matrix.runner }}
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      BUILD_MANIFEST_NAME: target/distrib/${{ join(matrix.targets, '-') }}-dist-manifest.json
     steps:
-
-      # Build all crates with a statically linked MSVCRT. Specifically crates
-      # that use `cc` in their build scripts (like libgit2-sys), will detect this
-      # and compile objects appropriatly. If there is a way to put this into a
-      # Cargo config file some where, let me know. .cargo/config did not work.
-      - name: Statically link MSVCRT
-        shell: bash
-        if: matrix.os == 'windows'
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: swatinem/rust-cache@v2
+      - name: Install cargo-dist
+        run: ${{ matrix.install_dist }}
+      # Get the dist-manifest
+      - name: Fetch local artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: artifacts-*
+          path: target/distrib/
+          merge-multiple: true
+      - name: Install dependencies
         run: |
-          echo "RUSTFLAGS=-C target-feature=+crt-static" >> $GITHUB_ENV
-
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-          override: true
-          target: ${{ matrix.target }}
-          profile: minimal
-
-      - uses: actions-rs/cargo@v1
-        with:
-          use-cross: ${{ matrix.use-cross }}
-          command: build
-          args: --release --target ${{ matrix.target }}
-
-      - name: Strip release binary (macos)
-        if: matrix.os == 'macos'
-        run: strip "target/${{ matrix.target }}/release/${{ env.PROGRAM_NAME }}"
-
-      - name: Build archive
+          ${{ matrix.packages_install }}
+      - name: Build artifacts
+        run: |
+          # Actually do builds and make zips and whatnot
+          cargo dist build ${{ needs.plan.outputs.tag-flag }} --print=linkage --output-format=json ${{ matrix.dist_args }} > dist-manifest.json
+          echo "cargo dist ran successfully"
+      - id: cargo-dist
+        name: Post-build
+        # We force bash here just because github makes it really hard to get values up
+        # to "real" actions without writing to env-vars, and writing to env-vars has
+        # inconsistent syntax between shell and powershell.
         shell: bash
         run: |
-          staging="${PROGRAM_NAME}-${{ github.ref_name }}-${{ matrix.target }}"
-          mkdir -p "$staging"/doc
+          # Parse out what we just built and upload it to scratch storage
+          echo "paths<<EOF" >> "$GITHUB_OUTPUT"
+          jq --raw-output ".artifacts[]?.path | select( . != null )" dist-manifest.json >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
 
-          cp {README.md,LICENSE} "$staging/"
-          cp CHANGELOG.md "$staging/doc/"
-
-          if [ "${{ matrix.os }}" = "windows" ]; then
-            cp "target/${{ matrix.target }}/release/${PROGRAM_NAME}.exe" "$staging/"
-            7z a "$staging.zip" "$staging"
-            echo "ASSET=$staging.zip" >> $GITHUB_ENV
-          else
-            cp "target/${{ matrix.target }}/release/${PROGRAM_NAME}" "$staging/"
-            tar czf "$staging.tar.gz" "$staging"
-            echo "ASSET=$staging.tar.gz" >> $GITHUB_ENV
-          fi
-
-      - name: Upload release archive
-        uses: actions/upload-release-asset@v1.0.2
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          cp dist-manifest.json "$BUILD_MANIFEST_NAME"
+      - name: "Upload artifacts"
+        uses: actions/upload-artifact@v4
         with:
-          upload_url: ${{ needs.create-release.outputs.upload_url }}
-          asset_path: ${{ env.ASSET }}
-          asset_name: ${{ env.ASSET }}
-          asset_content_type: application/octet-stream
+          name: artifacts-build-local-${{ join(matrix.targets, '_') }}
+          path: |
+            ${{ steps.cargo-dist.outputs.paths }}
+            ${{ env.BUILD_MANIFEST_NAME }}
 
-  publish-release:
-    if: github.ref_type == 'tag'
-    needs: ["create-release", "build-release"]
-    runs-on: ubuntu-20.04
+  # Build and package all the platform-agnostic(ish) things
+  build-global-artifacts:
+    needs:
+      - plan
+      - build-local-artifacts
+    runs-on: "ubuntu-20.04"
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      BUILD_MANIFEST_NAME: target/distrib/global-dist-manifest.json
     steps:
-      - name: Publish release, by setting draft to false
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Install cargo-dist
+        shell: bash
+        run: "curl --proto '=https' --tlsv1.2 -LsSf https://github.com/axodotdev/cargo-dist/releases/download/v0.11.1/cargo-dist-installer.sh | sh"
+      # Get all the local artifacts for the global tasks to use (for e.g. checksums)
+      - name: Fetch local artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: artifacts-*
+          path: target/distrib/
+          merge-multiple: true
+      - id: cargo-dist
         shell: bash
         run: |
-          curl \
-            -Ssf \
-            -X PATCH \
-            -H "Accept: application/vnd.github.v3+json" \
-            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-            "https://api.github.com/repos/${{ github.repository }}/releases/${{ needs.create-release.outputs.id }}" \
-            -d '{"draft":false}'
+          cargo dist build ${{ needs.plan.outputs.tag-flag }} --output-format=json "--artifacts=global" > dist-manifest.json
+          echo "cargo dist ran successfully"
+
+          # Parse out what we just built and upload it to scratch storage
+          echo "paths<<EOF" >> "$GITHUB_OUTPUT"
+          jq --raw-output ".artifacts[]?.path | select( . != null )" dist-manifest.json >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+          cp dist-manifest.json "$BUILD_MANIFEST_NAME"
+      - name: "Upload artifacts"
+        uses: actions/upload-artifact@v4
+        with:
+          name: artifacts-build-global
+          path: |
+            ${{ steps.cargo-dist.outputs.paths }}
+            ${{ env.BUILD_MANIFEST_NAME }}
+  # Determines if we should publish/announce
+  host:
+    needs:
+      - plan
+      - build-local-artifacts
+      - build-global-artifacts
+    # Only run if we're "publishing", and only if local and global didn't fail (skipped is fine)
+    if: ${{ always() && needs.plan.outputs.publishing == 'true' && (needs.build-global-artifacts.result == 'skipped' || needs.build-global-artifacts.result == 'success') && (needs.build-local-artifacts.result == 'skipped' || needs.build-local-artifacts.result == 'success') }}
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    runs-on: "ubuntu-20.04"
+    outputs:
+      val: ${{ steps.host.outputs.manifest }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Install cargo-dist
+        run: "curl --proto '=https' --tlsv1.2 -LsSf https://github.com/axodotdev/cargo-dist/releases/download/v0.11.1/cargo-dist-installer.sh | sh"
+      # Fetch artifacts from scratch-storage
+      - name: Fetch artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: artifacts-*
+          path: target/distrib/
+          merge-multiple: true
+      # This is a harmless no-op for Github Releases, hosting for that happens in "announce"
+      - id: host
+        shell: bash
+        run: |
+          cargo dist host ${{ needs.plan.outputs.tag-flag }} --steps=upload --steps=release --output-format=json > dist-manifest.json
+          echo "artifacts uploaded and released successfully"
+          cat dist-manifest.json
+          echo "manifest=$(jq -c "." dist-manifest.json)" >> "$GITHUB_OUTPUT"
+      - name: "Upload dist-manifest.json"
+        uses: actions/upload-artifact@v4
+        with:
+          # Overwrite the previous copy
+          name: artifacts-dist-manifest
+          path: dist-manifest.json
+
+  # Create a Github Release while uploading all files to it
+  announce:
+    needs:
+      - plan
+      - host
+    # use "always() && ..." to allow us to wait for all publish jobs while
+    # still allowing individual publish jobs to skip themselves (for prereleases).
+    # "host" however must run to completion, no skipping allowed!
+    if: ${{ always() && needs.host.result == 'success' }}
+    runs-on: "ubuntu-20.04"
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: "Download Github Artifacts"
+        uses: actions/download-artifact@v4
+        with:
+          pattern: artifacts-*
+          path: artifacts
+          merge-multiple: true
+      - name: Cleanup
+        run: |
+          # Remove the granular manifests
+          rm -f artifacts/*-dist-manifest.json
+      - name: Create Github Release
+        uses: ncipollo/release-action@v1
+        with:
+          tag: ${{ needs.plan.outputs.tag }}
+          name: ${{ fromJson(needs.host.outputs.val).announcement_title }}
+          body: ${{ fromJson(needs.host.outputs.val).announcement_github_body }}
+          prerelease: ${{ fromJson(needs.host.outputs.val).announcement_is_prerelease }}
+          artifacts: "artifacts/*"
