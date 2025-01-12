@@ -13,12 +13,49 @@
             Rename
         </button>
         -->
-        <a class="btn BtnGroup-item btn-sm hide-sm hide-md" href="{{edit_url}}"
-            id="minibutton-edit-page">
+        <a class="btn BtnGroup-item btn-sm hide-sm hide-md" href="{{edit_url}}" id="minibutton-edit-page">
             Edit
         </a>
     </div>
 </div>
+<script>
+    function close_new_page_dialog() {
+        document.getElementById('new-page-details').removeAttribute('open');
+    }
+</script>
+<details class="details-reset details-overlay details-overlay-dark" id="new-page-details">
+    <summary class="btn btn-primary" aria-haspopup="dialog">New</summary>
+    <details-dialog class="Box Box--overlay d-flex flex-column anim-fade-in fast position-absolute"
+        style="left: 50%; z-index: 200;">
+        <div class="Box-header">
+            <button class="Box-btn-octicon btn-octicon float-right" type="button" aria-label="Close dialog"
+                data-close-dialog onclick="close_new_page_dialog()">
+                <svg class="octicon octicon-x" viewBox="0 0 12 16" version="1.1" width="12" height="16"
+                    aria-hidden="true">
+                    <path fill-rule="evenodd"
+                        d="M7.48 8l3.75 3.75-1.48 1.48L6 9.48l-3.75 3.75-1.48-1.48L4.52 8 .77 4.25l1.48-1.48L6 6.52l3.75-3.75 1.48 1.48L7.48 8z">
+                    </path>
+                </svg>
+            </button>
+            <h3 class="Box-title">Create a new page</h3>
+        </div>
+        <form action="/new" method="get">
+            <div class="Box-body">
+                <div class="form-group">
+                    <div class="form-group-header">
+                        <label for="page-name">Page name</label>
+                    </div>
+                    <div class="form-group-body">
+                        <input class="form-control" type="text" id="page-name" name="page-name" />
+                    </div>
+                </div>
+            </div>
+            <div class="Box-footer">
+                <button type="submit" class="btn btn-block btn-primary" data-close-dialog>Create</button>
+            </div>
+        </form>
+    </details-dialog>
+</details>
 {% endblock %}
 
 
@@ -27,5 +64,6 @@
 <div class="markdown-body">
     {{content}}
 </div>
+
 
 {% endblock %}
